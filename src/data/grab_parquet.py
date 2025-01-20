@@ -1,12 +1,7 @@
 from minio import Minio
-import urllib.request
 import pandas as pd
-import sys
 import os
 import requests
-
-def main():
-    grab_data()
 
 try:
     import pyarrow.parquet as pq
@@ -16,80 +11,86 @@ except ImportError:
         import fastparquet
         engine = 'fastparquet'
     except ImportError:
-        raise ImportError("Unable to find a usable engine; please install 'pyarrow' or 'fastparquet' to use parquet support.")    
+        raise ImportError("Unable to find a usable engine; please install 'pyarrow' or 'fastparquet' to use parquet support.")
+
+def upload_to_minio(file_path: str, client: Minio, bucket_name: str) -> None:
+    """
+    Upload a file to MinIO.
+
+    Args:
+        file_path (str): Path of the file to upload.
+        client (Minio): MinIO client instance.
+        bucket_name (str): Name of the MinIO bucket.
+    """
+    object_name = os.path.basename(file_path)  # Nom du fichier dans le bucket
+    try:
+        client.fput_object(bucket_name, object_name, file_path)
+        print(f"Uploaded {file_path} to bucket {bucket_name} as {object_name}.")
+    except Exception as e:
+        print(f"Failed to upload {file_path} to MinIO: {e}")
 
 def grab_data() -> None:
     """
-    Grab the data from New York Yellow Taxi
+    Download and upload data to MinIO.
 
-    This method downloads parquet files of the New York Yellow Taxi from January 2024 to December 2024.
-    Files are saved into "../../data/raw" folder.
-    This method then combines all parquet files into a single parquet file named "yellow_tripdata_2024.parquet".
+    This method downloads parquet files of the New York Yellow Taxi from January 2023 to August 2023.
+    Files are saved into "data/raw" folder and uploaded to MinIO.
     """
-    # Base URL for the NYC Yellow Taxi Trip Records on Google Cloud Storage
+    # Base URL for the NYC Yellow Taxi Trip Records
     base_url = "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_"
-    
-    # Create the target directory if it does not exist
     data_dir = "data/raw"
     if not os.path.exists(data_dir):
         os.makedirs(data_dir)
     
-    # Download files from January 2024 to December 2024
-    parquet_files = []
-    for month in range(1, 13):
-        # Format the month to be two digits (e.g., 01, 02, ..., 12)
-        month_str = f"{month:02d}"
-        
-        # Construct the URL for the current year and month
-        file_url = f"{base_url}2024-{month_str}.parquet"
-        
-        # Define the local file path where the file will be saved
-        local_file_path = os.path.join(data_dir, f"yellow_tripdata_2024-{month_str}.parquet")
-        
-        # Download the file if it does not already exist
-        if not os.path.exists(local_file_path):
-            print(f"Downloading {file_url}...")
-            response = requests.get(file_url, stream=True)
-            if response.status_code == 200:
-                with open(local_file_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=1024):
-                        f.write(chunk)
-                print(f"Saved to {local_file_path}")
-                parquet_files.append(local_file_path)  # Only add if download was successful
-            else:
-                print(f"Failed to download {file_url}: Status code {response.status_code}")
-        else:
-            print(f"File {local_file_path} already exists, skipping download.")
-            parquet_files.append(local_file_path)  # Add existing file to the list
+    # Configuration MinIO
+    client = Minio(
+        "127.0.0.1:9000",  # Adresse de MinIO
+        access_key="minio",  # Remplace si tu utilises d'autres identifiants
+        secret_key="minio123",
+        secure=False  # Désactiver HTTPS pour le local
+    )
+    bucket_name = "parquet-bucket"
 
-    # Combine all the downloaded parquet files into a single parquet file
-    valid_parquet_files = [file for file in parquet_files if os.path.exists(file)]
-    if valid_parquet_files:
-        combined_df = pd.concat([pd.read_parquet(file, engine=engine) for file in valid_parquet_files], ignore_index=True)
-        combined_file_path = os.path.join(data_dir, "yellow_tripdata_2024.parquet")
+    # Crée le bucket s'il n'existe pas
+    if not client.bucket_exists(bucket_name):
+        client.make_bucket(bucket_name)
+        print(f"Bucket '{bucket_name}' created.")
+
+    # Télécharger les fichiers de janvier à août 2023
+    parquet_files = []
+    for year, months in [(2023, range(1, 9))]:  # Janvier à Août 2023
+        for month in months:
+            month_str = f"{month:02d}"
+            file_url = f"{base_url}{year}-{month_str}.parquet"
+            local_file_path = os.path.join(data_dir, f"yellow_tripdata_{year}-{month_str}.parquet")
+            
+            if not os.path.exists(local_file_path):
+                try:
+                    print(f"Downloading {file_url}...")
+                    response = requests.get(file_url, stream=True)
+                    response.raise_for_status()
+                    with open(local_file_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=1024):
+                            f.write(chunk)
+                    print(f"Saved to {local_file_path}")
+
+                    # Upload vers MinIO
+                    upload_to_minio(local_file_path, client, bucket_name)
+                    parquet_files.append(local_file_path)
+                except requests.exceptions.RequestException as e:
+                    print(f"Failed to download {file_url}: {e}")
+                    continue
+
+    # Combiner les fichiers téléchargés en un seul fichier Parquet
+    if parquet_files:
+        combined_df = pd.concat([pd.read_parquet(file, engine=engine) for file in parquet_files], ignore_index=True)
+        combined_file_path = os.path.join(data_dir, "yellow_tripdata_2023.parquet")
         combined_df.to_parquet(combined_file_path, index=False, engine=engine)
         print(f"Combined parquet file saved to {combined_file_path}")
+        # Upload du fichier combiné vers MinIO
+        upload_to_minio(combined_file_path, client, bucket_name)
     else:
         print("No valid parquet files were downloaded.")
 
-
-def write_data_minio():
-    """
-    This method put all Parquet files into Minio
-    Ne pas faire cette méthode pour le moment
-    """
-    client = Minio(
-        "localhost:9000",
-        secure=False,
-        access_key="minio",
-        secret_key="minio123"
-    )
-    bucket: str = "NOM_DU_BUCKET_ICI"
-    found = client.bucket_exists(bucket)
-    if not found:
-        client.make_bucket(bucket)
-    else:
-        print("Bucket " + bucket + " existe déjà")
-
 if __name__ == '__main__':
-    sys.exit(main())
+    grab_data()
